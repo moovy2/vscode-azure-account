@@ -3,13 +3,11 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { callWithTelemetryAndErrorHandling, createApiProvider, createAzExtOutputChannel, createExperimentationService, IActionContext, registerCommand, registerReportIssueCommand, registerUIExtensionVariables } from '@microsoft/vscode-azext-utils';
-import { AzureExtensionApiProvider } from '@microsoft/vscode-azext-utils/api';
-import { createReadStream } from 'fs';
-import { basename } from 'path';
-import { CancellationToken, ConfigurationTarget, env, ExtensionContext, ProgressLocation, Uri, window, workspace, WorkspaceConfiguration } from 'vscode';
+import { IActionContext, apiUtils, callWithTelemetryAndErrorHandling, createApiProvider, createAzExtLogOutputChannel, createExperimentationService, registerCommand, registerReportIssueCommand, registerUIExtensionVariables } from '@microsoft/vscode-azext-utils';
+import axios from 'axios';
+import { ConfigurationTarget, ExtensionContext, Uri, WorkspaceConfiguration, env, window, workspace } from 'vscode';
 import { AzureAccountExtensionApi } from './azure-account.api';
-import { createCloudConsole, OSes, OSName, shells } from './cloudConsole/cloudConsole';
+import { manageAccount } from './commands/manageAccount';
 import { cloudSetting, displayName, extensionPrefix, showSignedInEmailSetting } from './constants';
 import { ext } from './extensionVariables';
 import { AzureAccountLoginHelper } from './login/AzureAccountLoginHelper';
@@ -24,17 +22,19 @@ import { updateSubscriptionsAndTenants } from './login/updateSubscriptions';
 import { survey } from './nps';
 import { localize } from './utils/localize';
 import { logErrorMessage } from './utils/logErrorMessage';
+import { setupAxiosLogging } from './utils/logging/axios/AxiosNormalizer';
 import { getSettingValue } from './utils/settingUtils';
 
 const enableLogging: boolean = false;
 
-export async function activateInternal(context: ExtensionContext, perfStats: { loadStartTime: number; loadEndTime: number }): Promise<AzureExtensionApiProvider> {
+export async function activateInternal(context: ExtensionContext, perfStats: { loadStartTime: number; loadEndTime: number }): Promise<apiUtils.AzureExtensionApiProvider> {
 	ext.context = context;
-	ext.outputChannel = createAzExtOutputChannel(displayName, extensionPrefix);
+	ext.outputChannel = createAzExtLogOutputChannel(displayName);
 	ext.uriEventHandler = new UriEventHandler();
 	context.subscriptions.push(ext.outputChannel);
 	context.subscriptions.push(window.registerUriHandler(ext.uriEventHandler));
 	registerUIExtensionVariables(ext);
+	setupAxiosLogging(axios, ext.outputChannel);
 
 	await callWithTelemetryAndErrorHandling('azure-account.activate', async (activateContext: IActionContext) => {
 		activateContext.telemetry.properties.isActivationEvent = 'true';
@@ -55,23 +55,12 @@ export async function activateInternal(context: ExtensionContext, perfStats: { l
 		registerCommand('azure-account.selectTenant', selectTenant);
 		registerCommand('azure-account.askForLogin', askForLogin);
 		registerCommand('azure-account.createAccount', createAccount);
-		registerCommand('azure-account.uploadFileCloudConsole', uploadFile);
+		registerCommand('azure-account.manageAccount', manageAccount);
 		context.subscriptions.push(ext.loginHelper.api.onSessionsChanged(updateSubscriptionsAndTenants));
 		context.subscriptions.push(ext.loginHelper.api.onSubscriptionsChanged(() => updateFilters()));
 		registerReportIssueCommand('azure-account.reportIssue');
 
-		context.subscriptions.push(window.registerTerminalProfileProvider('azure-account.cloudShellBash', {
-			provideTerminalProfile: (token: CancellationToken) => {
-				return createCloudConsole(ext.loginHelper.api, 'Linux', token).terminalProfile;
-			}
-		}));
-		context.subscriptions.push(window.registerTerminalProfileProvider('azure-account.cloudShellPowerShell', {
-			provideTerminalProfile: (token: CancellationToken) => {
-				return createCloudConsole(ext.loginHelper.api, 'Windows', token).terminalProfile;
-			}
-		}));
-
-		await survey(context);
+		survey(context);
 	});
 
 	return Object.assign(ext.loginHelper.legacyApi, createApiProvider([ext.loginHelper.api]));
@@ -95,43 +84,6 @@ async function migrateEnvironmentSetting() {
 
 	await migrateSetting('Azure', 'AzureCloud');
 	await migrateSetting('AzureChina', 'AzureChinaCloud');
-}
-
-function cloudConsole(os: OSName) {
-	const shell = ext.loginHelper.api.createCloudShell(os);
-	if (shell) {
-		void shell.terminal.then(terminal => terminal.show());
-		return shell;
-	}
-}
-
-function uploadFile(_context: IActionContext, uri?: Uri) {
-	(async () => {
-		let shell = shells[0];
-		if (!shell) {
-			const shellName = await window.showInformationMessage(localize('azure-account.uploadingRequiresOpenCloudConsole', "File upload requires an open Cloud Shell."), OSes.Linux.shellName, OSes.Windows.shellName);
-			if (!shellName) {
-				return;
-			}
-			// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-			shell = cloudConsole(shellName === OSes.Linux.shellName ? 'Linux' : 'Windows')!;
-		}
-		if (!uri) {
-			uri = (await window.showOpenDialog({}) || [])[0];
-		}
-		if (uri) {
-			const filename = basename(uri.fsPath);
-			return window.withProgress({
-				location: ProgressLocation.Notification,
-				title: localize('azure-account.uploading', "Uploading '{0}'...", filename),
-				cancellable: true
-			}, (progress, token) => {
-				// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-				return shell.uploadFile(filename, createReadStream(uri!.fsPath), { progress, token });
-			});
-		}
-	})()
-		.catch(logErrorMessage);
 }
 
 function logDiagnostics(context: ExtensionContext, api: AzureAccountExtensionApi) {
@@ -166,8 +118,15 @@ function createAccount() {
 function createStatusBarItem(context: ExtensionContext, api: AzureAccountExtensionApi) {
 	const statusBarItem = window.createStatusBarItem('azure-account.status');
 	statusBarItem.name = localize('azure-account.status', 'Azure Account Status');
-	statusBarItem.command = "azure-account.selectSubscriptions";
+	statusBarItem.command = "azure-account.manageAccount";
 	function updateStatusBar() {
+		// Since Azure Account is deprecated, we only show the status bar item when the user has explicitly enabled it
+		const showStatusBar = getSettingValue<boolean>('azure-account.showStatusBar');
+		if (!showStatusBar) {
+			statusBarItem.hide();
+			return;
+		}
+
 		switch (api.status) {
 			case 'LoggingIn':
 				statusBarItem.text = localize('azure-account.loggingIn', "Azure: Signing in...");

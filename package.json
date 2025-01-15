@@ -15,11 +15,11 @@
         "color": "#0072c6",
         "theme": "dark"
     },
-    "version": "0.11.2-alpha.0",
+    "version": "0.12.0",
     "aiKey": "0c6ae279ed8443289764825290e4f9e2-1a736e7c-1324-4338-be46-fc2a58ae4d14-7255",
     "publisher": "ms-vscode",
     "engines": {
-        "vscode": "^1.65.0"
+        "vscode": "^1.75.0"
     },
     "categories": [
         "Azure"
@@ -35,10 +35,7 @@
         "onCommand:azure-account.logout",
         "onCommand:azure-account.reportIssue",
         "onCommand:azure-account.selectSubscriptions",
-        "onCommand:azure-account.selectTenant",
-        "onCommand:azure-account.uploadFileCloudConsole",
-        "onTerminalProfile:azure-account.cloudShellBash",
-        "onTerminalProfile:azure-account.cloudShellPowerShell"
+        "onCommand:azure-account.selectTenant"
     ],
     "main": "./main",
     "contributes": {
@@ -69,6 +66,11 @@
                 "category": "%azure-account.commands.azure%"
             },
             {
+                "command": "azure-account.manageAccount",
+                "title": "%azure-account.commands.manageAccount%",
+                "category": "%azure-account.commands.azure%"
+            },
+            {
                 "command": "azure-account.reportIssue",
                 "title": "%azure-account.commands.reportIssue%",
                 "category": "%azure-account.commands.azureAccount%"
@@ -82,40 +84,17 @@
                 "command": "azure-account.selectTenant",
                 "title": "%azure-account.commands.selectTenant%",
                 "category": "%azure-account.commands.azure%"
-            },
-            {
-                "command": "azure-account.uploadFileCloudConsole",
-                "title": "%azure-account.commands.uploadFileCloudConsole%",
-                "category": "%azure-account.commands.azure%"
             }
         ],
         "menus": {
-            "explorer/context": [
+            "commandPalette": [
                 {
-                    "command": "azure-account.uploadFileCloudConsole",
-                    "when": "resourceScheme == file && !explorerResourceIsFolder && openCloudConsoleCount && openCloudConsoleCount != 0",
-                    "group": "999_cloudConsole"
-                }
-            ],
-            "editor/title/context": [
-                {
-                    "command": "azure-account.uploadFileCloudConsole",
-                    "when": "resourceScheme == file && openCloudConsoleCount && openCloudConsoleCount != 0",
-                    "group": "999_cloudConsole"
-                }
-            ]
-        },
-        "terminal": {
-            "profiles": [
-                {
-                    "title": "%azure-account.cloudShellBash%",
-                    "id": "azure-account.cloudShellBash",
-                    "icon": "azure"
+                    "command": "azure-account.createAccount",
+                    "when": "never"
                 },
                 {
-                    "title": "%azure-account.cloudShellPowerShell%",
-                    "id": "azure-account.cloudShellPowerShell",
-                    "icon": "azure"
+                    "command": "azure-account.manageAccount",
+                    "when": "never"
                 }
             ]
         },
@@ -123,20 +102,25 @@
             "type": "object",
             "title": "Azure configuration",
             "properties": {
+                "azure.azure-account.showStatusBar": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Whether to show the Azure Account status bar item. For use with extensions that aren't updated to use the new built in authentication APIs."
+                },
                 "azure.resourceFilter": {
                     "type": "array",
                     "default": null,
-                    "description": "The resource filter, each element is a tenant id and a subscription id separated by a slash."
+                    "description": "(Deprecated) The resource filter, each element is a tenant id and a subscription id separated by a slash."
                 },
                 "azure.showSignedInEmail": {
                     "type": "boolean",
                     "default": true,
-                    "description": "Whether to show the email address (e.g., in the status bar) of the signed in account."
+                    "description": "(Deprecated) Whether to show the email address (e.g., in the status bar) of the signed in account."
                 },
                 "azure.tenant": {
                     "type": "string",
                     "default": "",
-                    "description": "A specific tenant to sign in to. The default is to sign in to the common tenant and use all known tenants. Note: You must sign out and sign back in after modifying this setting for it to take effect."
+                    "description": "(Deprecated) A specific tenant to sign in to. The default is to sign in to the common tenant and use all known tenants. Note: You must sign out and sign back in after modifying this setting for it to take effect."
                 },
                 "azure.cloud": {
                     "type": "string",
@@ -155,11 +139,11 @@
                         "Azure Custom Cloud"
                     ],
                     "default": "AzureCloud",
-                    "description": "The current Azure Cloud to connect to. Note: You must sign out and sign back in after modifying this setting for it to take effect."
+                    "description": "(Deprecated) The current Azure Cloud to connect to. Note: You must sign out and sign back in after modifying this setting for it to take effect."
                 },
                 "azure.customCloud.resourceManagerEndpointUrl": {
                     "type": "string",
-                    "description": "The management endpoint for your Azure Custom Cloud environment.",
+                    "description": "(Deprecated) The management endpoint for your Azure Custom Cloud environment.",
                     "scope": "application"
                 },
                 "azure.ppe": {
@@ -218,7 +202,7 @@
                         }
                     },
                     "default": null,
-                    "description": "Development setting: The PPE environment for testing.",
+                    "description": "(Deprecated) Development setting: The PPE environment for testing.",
                     "scope": "application"
                 },
                 "azure.authenticationLibrary": {
@@ -231,7 +215,7 @@
                         "Azure Active Directory Authentication Library",
                         "Microsoft Authentication Library (Preview)"
                     ],
-                    "description": "The authentication library to use. Note: You must sign out and reload the window after modifying this setting for it to take effect.",
+                    "description": "(Deprecated) The authentication library to use. Note: You must sign out and reload the window after modifying this setting for it to take effect.",
                     "default": "ADAL",
                     "tags": [
                         "experimental"
@@ -239,6 +223,20 @@
                     "scope": "machine-overridable"
                 }
             }
+        }
+    },
+    "capabilities": {
+        "untrustedWorkspaces": {
+            "supported": "limited",
+            "description": "%azure-account.capabilities.untrustedWorkspaces.description%",
+            "restrictedConfigurations": [
+                "azure.resourceFilter",
+                "azure.tenant",
+                "azure.cloud",
+                "azure.customCloud.resourceManagerEndpointUrl",
+                "azure.ppe",
+                "azure.authenticationLibrary"
+            ]
         }
     },
     "scripts": {
@@ -252,22 +250,22 @@
         "lint-fix": "eslint --ext .ts . --fix",
         "package": "vsce package --githubBranch main",
         "which": "which tsc",
-        "prepare": "husky install"
+        "prepare": "husky install",
+        "test": " "
     },
     "devDependencies": {
         "@microsoft/eslint-config-azuretools": "^0.1.0",
         "@types/form-data": "2.2.1",
         "@types/fs-extra": "^9.0.11",
         "@types/gulp": "^4.0.6",
-        "@types/http-proxy-agent": "2.0.1",
         "@types/node": "^14.0.0",
         "@types/node-fetch": "^2.5.10",
         "@types/request": "2.48.1",
         "@types/request-promise": "4.1.42",
         "@types/semver": "5.5.0",
         "@types/uuid": "^8.3.0",
-        "@types/vscode": "1.65.0",
-        "@types/ws": "6.0.1",
+        "@types/vscode": "^1.74.0",
+        "@types/ws": "^8.5.3",
         "@typescript-eslint/eslint-plugin": "^4.14.2",
         "copy-webpack-plugin": "^6.0.0",
         "eslint": "^7.19.0",
@@ -281,7 +279,7 @@
         "typescript": "^4.0.2",
         "vsce": "^2.6.7",
         "vscode-azureextensiondev": "^0.10.2",
-        "webpack": "^5.24.1",
+        "webpack": "^5.76.0",
         "webpack-cli": "^4.5.0"
     },
     "dependencies": {
@@ -291,19 +289,22 @@
         "@azure/ms-rest-azure-env": "^2.0.0",
         "@azure/ms-rest-js": "^2.6.0",
         "@azure/ms-rest-nodeauth": "^3.0.10",
-        "@azure/msal-node": "^1.3.0",
-        "@microsoft/vscode-azext-utils": "^0.3.7",
+        "@azure/msal-node": "^1.14.6",
+        "@microsoft/vscode-azext-utils": "^2.5.1",
         "adal-node": "^0.2.3",
         "form-data": "2.3.3",
-        "http-proxy-agent": "2.1.0",
-        "https-proxy-agent": "2.2.3",
+        "http-proxy-agent": "^5.0.0",
+        "https-proxy-agent": "^5.0.1",
         "ms-rest-azure": "^2.6.2",
         "node-fetch": "^2.6.1",
         "request": "2.88.0",
         "request-promise": "4.2.2",
-        "semver": "5.6.0",
+        "semver": "7.5.2",
         "uuid": "^8.3.2",
         "vscode-nls": "4.0.0",
-        "ws": "7.4.6"
-    }
+        "ws": "^8.9.0"
+    },
+    "extensionDependencies": [
+        "ms-azuretools.vscode-azureresourcegroups"
+    ]
 }

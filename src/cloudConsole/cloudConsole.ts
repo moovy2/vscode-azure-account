@@ -7,15 +7,16 @@ import { callWithTelemetryAndErrorHandlingSync, IActionContext, IParsedError, pa
 import * as cp from 'child_process';
 import * as FormData from 'form-data';
 import { ReadStream } from 'fs';
+import * as http from 'http';
 import { ClientRequest } from 'http';
-import { DeviceTokenCredentials } from 'ms-rest-azure';
 import { Socket } from 'net';
-import fetch, { Response } from 'node-fetch';
+import { Response } from 'node-fetch';
 import * as path from 'path';
+import * as request from 'request-promise';
 import * as semver from 'semver';
 import { parse, UrlWithStringQuery } from 'url';
 import { v4 as uuid } from 'uuid';
-import { CancellationToken, commands, Disposable, env, EventEmitter, MessageItem, QuickPickItem, Terminal, TerminalOptions, TerminalProfile, ThemeIcon, UIKind, Uri, version, window } from 'vscode';
+import { CancellationToken, commands, Disposable, env, EventEmitter, MessageItem, QuickPickItem, Terminal, TerminalOptions, TerminalProfile, ThemeIcon, UIKind, Uri, version, window, workspace } from 'vscode';
 import { AzureAccountExtensionApi, AzureLoginStatus, AzureSession, CloudShell, CloudShellStatus, UploadOptions } from '../azure-account.api';
 import { AzureSession as AzureSessionLegacy } from '../azure-account.legacy.api';
 import { ext } from '../extensionVariables';
@@ -24,8 +25,11 @@ import { tokenFromRefreshToken } from '../login/adal/tokens';
 import { getAuthLibrary } from '../login/getAuthLibrary';
 import { localize } from '../utils/localize';
 import { logErrorMessage } from '../utils/logErrorMessage';
+import { HttpLogger } from '../utils/logging/HttpLogger';
+import { fetchWithLogging } from '../utils/logging/nodeFetch/nodeFetch';
+import { RequestNormalizer } from '../utils/logging/request/RequestNormalizer';
 import { Deferred } from '../utils/promiseUtils';
-import { AccessTokens, connectTerminal, ConsoleUris, Errors, getUserSettings, provisionConsole, resetConsole, Size, UserSettings } from './cloudConsoleLauncher';
+import { delay } from '../utils/timeUtils';
 import { CloudShellInternal } from './CloudShellInternal';
 import { createServer, Queue, readJSON, Server } from './ipc';
 
@@ -210,6 +214,11 @@ export function createCloudConsole(api: AzureAccountExtensionApi, osName: OSName
 
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		(async function (): Promise<any> {
+			if (!workspace.isTrusted) {
+				updateStatus('Disconnected');
+				return requiresWorkspaceTrust(context);
+			}
+
 			void commands.executeCommand('setContext', 'openCloudConsoleCount', `${shells.length}`);
 
 			const isWindows: boolean = process.platform === 'win32';
@@ -278,7 +287,8 @@ export function createCloudConsole(api: AzureAccountExtensionApi, osName: OSName
 				shellArgs.shift();
 			}
 
-			if (!isWindows && env.uiKind === UIKind.Desktop && semver.gte(version, '1.62.1')) {
+			// Only add flag if in Electron process https://github.com/microsoft/vscode-azure-account/pull/684
+			if (!isWindows && !!process.versions['electron'] && env.uiKind === UIKind.Desktop && semver.gte(version, '1.62.1')) {
 				// https://github.com/microsoft/vscode/issues/136987
 				// This fix can't be applied to all versions of VS Code. An error is thrown in versions less than the one specified
 				shellArgs.push('--ms-enable-electron-run-as-node');
@@ -369,7 +379,7 @@ export function createCloudConsole(api: AzureAccountExtensionApi, osName: OSName
 					.then(tenantDetails => tenantDetails.map(details => {
 						// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
 						const tenantDetails: TenantDetails = details!.tenantDetails;
-						const defaultDomainName: string | undefined = (tenantDetails.verifiedDomains.find(domain => domain.default))?.name;
+						const defaultDomainName: string | undefined = tenantDetails.defaultDomain;
 						return {
 							label: tenantDetails.displayName,
 							description: defaultDomainName,
@@ -377,9 +387,9 @@ export function createCloudConsole(api: AzureAccountExtensionApi, osName: OSName
 							session: details!.session
 						};
 					}).sort((a, b) => a.label.localeCompare(b.label))), {
-						placeHolder: localize('azure-account.selectDirectoryPlaceholder', "Select directory"),
-						ignoreFocusOut: true // The terminal opens concurrently and can steal focus (https://github.com/microsoft/vscode-azure-account/issues/77).
-					});
+					placeHolder: localize('azure-account.selectDirectoryPlaceholder', "Select directory"),
+					ignoreFocusOut: true // The terminal opens concurrently and can steal focus (https://github.com/microsoft/vscode-azure-account/issues/77).
+				});
 				if (!pick) {
 					context.telemetry.properties.outcome = 'noTenantPicked';
 					serverQueue.push({ type: 'exit' });
@@ -431,17 +441,12 @@ export function createCloudConsole(api: AzureAccountExtensionApi, osName: OSName
 				}
 			}
 
-			// Additional tokens
-			const [graphToken, keyVaultToken] = await Promise.all([
-				tokenFromRefreshToken(session.environment, result.token.refreshToken, session.tenantId, session.environment.activeDirectoryGraphResourceId),
-				session.environment.keyVaultDnsSuffix
+			const keyVaultToken = session.environment.keyVaultDnsSuffix
 					// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-					? tokenFromRefreshToken(session.environment, result.token.refreshToken, session.tenantId, `https://${session.environment.keyVaultDnsSuffix!.substr(1)}`)
-					: Promise.resolve(undefined)
-			]);
+					? await tokenFromRefreshToken(session.environment, result.token.refreshToken, session.tenantId, `https://${session.environment.keyVaultDnsSuffix!.substr(1)}`)
+					: undefined;
 			const accessTokens: AccessTokens = {
 				resource: accessToken,
-				graph: graphToken.accessToken,
 				keyVault: keyVaultToken && keyVaultToken.accessToken
 			};
 			// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
@@ -494,7 +499,8 @@ async function waitForLoginStatus(api: AzureAccountExtensionApi): Promise<AzureL
 
 async function findUserSettings(token: Token): Promise<{ userSettings: UserSettings; token: Token; } | undefined> {
 	const userSettings: UserSettings | undefined = await getUserSettings(token.accessToken, token.session.environment.resourceManagerEndpointUrl);
-	if (userSettings && userSettings.storageProfile) {
+	// Valid settings will have either a storage profile (mounted) or a session type of 'Ephemeral'.
+	if (userSettings && (userSettings.storageProfile || userSettings.sessionType === 'Ephemeral')) {
 		return { userSettings, token };
 	}
 }
@@ -525,6 +531,13 @@ async function requiresNode(context: IActionContext) {
 	}
 }
 
+async function requiresWorkspaceTrust(context: IActionContext) {
+	context.telemetry.properties.outcome = 'requiresWorkspaceTrust';
+	const ok: MessageItem = { title: localize('azure-account.ok', "OK") };
+	const message: string = localize('azure-account.cloudShellRequiresTrustedWorkspace', 'Opening a Cloud Shell only works in a trusted workspace.');
+	return await window.showInformationMessage(message, ok) === ok;
+}
+
 async function deploymentConflict(context: IActionContext, os: OS) {
 	context.telemetry.properties.outcome = 'deploymentConflict';
 	const ok: MessageItem = { title: localize('azure-account.ok', "OK") };
@@ -548,7 +561,7 @@ async function acquireToken(session: AzureSession): Promise<Token> {
 		const environment: any = session.environment;
 		// eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call
 		credentials.context.acquireToken(environment.activeDirectoryResourceId, credentials.username, credentials.clientId, function (err: any, result: any) {
-		/* eslint-enable @typescript-eslint/no-explicit-any */
+			/* eslint-enable @typescript-eslint/no-explicit-any */
 			if (err) {
 				reject(err);
 			} else {
@@ -567,54 +580,27 @@ async function acquireToken(session: AzureSession): Promise<Token> {
 interface TenantDetails {
 	objectId: string;
 	displayName: string;
-	verifiedDomains: { name: string; default: boolean; }[];
+	domains: string;
+	defaultDomain: string;
 }
 
 async function fetchTenantDetails(session: AzureSession): Promise<{ session: AzureSession, tenantDetails: TenantDetails }> {
-	// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any
-	const { username, clientId, tokenCache, domain } = <any>(<AzureSessionLegacy>session).credentials;
-	// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-	const graphCredentials: DeviceTokenCredentials = new DeviceTokenCredentials({ username, clientId, tokenCache, domain, tokenAudience: 'graph' });
 
-	const apiVersion: string = '1.6';
-	const requestUrl: string = `https://graph.windows.net/${encodeURIComponent(session.tenantId)}/tenantDetails?api-version=${encodeURIComponent(apiVersion)}`;
-
-	return new Promise((resolve, reject) => {
-		// eslint-disable-next-line @typescript-eslint/no-misused-promises, @typescript-eslint/no-explicit-any
-		graphCredentials.getToken(async (err: Error, result: any) => {
-			if (err) {
-				reject(err);
-				return;
-			}
-
-			if (result) {
-				try {
-					const response: Response = await fetch(requestUrl, {
-						headers: {
-							// eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
-							Authorization: `Bearer ${result.accessToken}`,
-							"x-ms-client-request-id": uuid(),
-							"Content-Type": 'application/json; charset=utf-8'
-						}
-					});
-
-					if (response.ok) {
-						// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-						const json = await response.json();
-						resolve({
-							session,
-							// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access
-							tenantDetails: json.value[0]
-						});
-					} else {
-						reject(response.statusText)
-					}
-				} catch (e) {
-					reject(e);
-				}
-			}
-		});
+	const response: Response = await fetchWithLogging('https://management.azure.com/tenants?api-version=2022-12-01', {
+		headers: {
+			Authorization: `Bearer ${(await session.credentials2.getToken([]))?.token}`,
+			"x-ms-client-request-id": uuid(),
+			"Content-Type": 'application/json; charset=utf-8'
+		}
 	});
+
+	// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+	const json = await response.json();
+	return {
+		session,
+		// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access
+		tenantDetails: json.value[0]
+	};
 }
 
 export interface ExecResult {
@@ -629,5 +615,214 @@ async function exec(command: string): Promise<ExecResult> {
 		cp.exec(command, (error, stdout, stderr) => {
 			(error || stderr ? reject : resolve)({ error, stdout, stderr });
 		});
+	});
+}
+
+
+const consoleApiVersion = '2023-02-01-preview';
+
+export enum Errors {
+	DeploymentOsTypeConflict = 'DeploymentOsTypeConflict'
+}
+
+function getConsoleUri(armEndpoint: string) {
+	return `${armEndpoint}/providers/Microsoft.Portal/consoles/default?api-version=${consoleApiVersion}`;
+}
+
+export interface UserSettings {
+	preferredLocation: string;
+	preferredOsType: string; // The last OS chosen in the portal.
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	storageProfile: any;
+	sessionType: 'Ephemeral' | 'Mounted';
+}
+
+export interface AccessTokens {
+	resource: string;
+	// graph: string;
+	keyVault?: string;
+}
+
+export interface ConsoleUris {
+	consoleUri: string;
+	terminalUri: string;
+	socketUri: string;
+}
+
+export interface Size {
+	cols: number;
+	rows: number;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function requestWithLogging(requestOptions: request.Options): Promise<any> {
+	try {
+		const requestLogger = new HttpLogger(ext.outputChannel, 'CloudConsoleLauncher', new RequestNormalizer());
+		requestLogger.logRequest(requestOptions);
+		// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+		const response: http.IncomingMessage & { body: unknown } = await request(requestOptions);
+		requestLogger.logResponse({ response, request: requestOptions });
+		// eslint-disable-next-line @typescript-eslint/no-unsafe-return
+		return response;
+	} catch (e) {
+		const error = parseError(e);
+		ext.outputChannel.error({ ...error, name: 'Request Error: CloudConsoleLauncher' });
+	}
+}
+
+export async function getUserSettings(accessToken: string, armEndpoint: string): Promise<UserSettings | undefined> {
+	const targetUri = `${armEndpoint}/providers/Microsoft.Portal/userSettings/cloudconsole?api-version=${consoleApiVersion}`;
+	// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+	const response = await requestWithLogging({
+		uri: targetUri,
+		method: 'GET',
+		headers: {
+			'Accept': 'application/json',
+			'Content-Type': 'application/json',
+			'Authorization': `Bearer ${accessToken}`
+		},
+		simple: false,
+		resolveWithFullResponse: true,
+		json: true,
+	});
+
+	// eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+	if (response.statusCode < 200 || response.statusCode > 299) {
+		// if (response.body && response.body.error && response.body.error.message) {
+		// 	console.log(`${response.body.error.message} (${response.statusCode})`);
+		// } else {
+		// 	console.log(response.statusCode, response.headers, response.body);
+		// }
+		return;
+	}
+
+	// eslint-disable-next-line @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-member-access
+	return response.body && response.body.properties;
+}
+
+/* eslint-disable @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment */
+export async function provisionConsole(accessToken: string, armEndpoint: string, userSettings: UserSettings, osType: string): Promise<string> {
+	let response = await createTerminal(accessToken, armEndpoint, userSettings, osType, true);
+	for (let i = 0; i < 10; i++, response = await createTerminal(accessToken, armEndpoint, userSettings, osType, false)) {
+		if (response.statusCode < 200 || response.statusCode > 299) {
+			if (response.statusCode === 409 && response.body && response.body.error && response.body.error.code === Errors.DeploymentOsTypeConflict) {
+				throw new Error(Errors.DeploymentOsTypeConflict);
+			} else if (response.body && response.body.error && response.body.error.message) {
+				throw new Error(`${response.body.error.message} (${response.statusCode})`);
+			} else {
+				throw new Error(`${response.statusCode} ${response.headers} ${response.body}`);
+			}
+		}
+
+		const consoleResource = response.body;
+		if (consoleResource.properties.provisioningState === 'Succeeded') {
+			// eslint-disable-next-line @typescript-eslint/no-unsafe-return
+			return consoleResource.properties.uri;
+		} else if (consoleResource.properties.provisioningState === 'Failed') {
+			break;
+		}
+	}
+	throw new Error(`Sorry, your Cloud Shell failed to provision. Please retry later. Request correlation id: ${response.headers['x-ms-routing-request-id']}`);
+}
+/* eslint-enable @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment */
+
+async function createTerminal(accessToken: string, armEndpoint: string, userSettings: UserSettings, osType: string, initial: boolean) {
+	return requestWithLogging({
+		uri: getConsoleUri(armEndpoint),
+		method: initial ? 'PUT' : 'GET',
+		headers: {
+			'Accept': 'application/json',
+			'Content-Type': 'application/json',
+			'Authorization': `Bearer ${accessToken}`,
+			'x-ms-console-preferred-location': userSettings.preferredLocation
+		},
+		simple: false,
+		resolveWithFullResponse: true,
+		json: true,
+		body: initial ? {
+			properties: {
+				osType
+			}
+		} : undefined
+	});
+}
+
+// eslint-disable-next-line @typescript-eslint/explicit-module-boundary-types
+export async function resetConsole(accessToken: string, armEndpoint: string) {
+	// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+	const response = await requestWithLogging({
+		uri: getConsoleUri(armEndpoint),
+		method: 'DELETE',
+		headers: {
+			'Accept': 'application/json',
+			'Content-Type': 'application/json',
+			'Authorization': `Bearer ${accessToken}`
+		},
+		simple: false,
+		resolveWithFullResponse: true,
+		json: true
+	});
+
+	/* eslint-disable @typescript-eslint/no-unsafe-member-access */
+	if (response.statusCode < 200 || response.statusCode > 299) {
+		if (response.body && response.body.error && response.body.error.message) {
+			throw new Error(`${response.body.error.message} (${response.statusCode})`);
+		} else {
+			throw new Error(`${response.statusCode} ${response.headers} ${response.body}`);
+		}
+	}
+	/* eslint-enable @typescript-eslint/no-unsafe-member-access */
+}
+
+export async function connectTerminal(accessTokens: AccessTokens, consoleUri: string, shellType: string, initialSize: Size, progress: (i: number) => void): Promise<ConsoleUris> {
+
+	for (let i = 0; i < 10; i++) {
+		/* eslint-disable @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment */
+		const response = await initializeTerminal(accessTokens, consoleUri, shellType, initialSize);
+
+		if (response.statusCode < 200 || response.statusCode > 299) {
+			if (response.statusCode !== 503 && response.statusCode !== 504 && response.body && response.body.error) {
+				if (response.body && response.body.error && response.body.error.message) {
+					throw new Error(`${response.body.error.message} (${response.statusCode})`);
+				} else {
+					throw new Error(`${response.statusCode} ${response.headers} ${response.body}`);
+				}
+			}
+			await delay(1000 * (i + 1));
+			progress(i + 1);
+			continue;
+		}
+
+		const { id, socketUri } = response.body;
+		const terminalUri = `${consoleUri}/terminals/${id}`;
+		return {
+			consoleUri,
+			terminalUri,
+			socketUri
+		};
+		/* eslint-enable @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment */
+	}
+
+	throw new Error('Failed to connect to the terminal.');
+}
+
+async function initializeTerminal(accessTokens: AccessTokens, consoleUri: string, shellType: string, initialSize: Size) {
+	const consoleUrl = new URL(consoleUri);
+	return requestWithLogging({
+		// eslint-disable-next-line @typescript-eslint/restrict-plus-operands
+		uri: consoleUri + '/terminals?cols=' + initialSize.cols + '&rows=' + initialSize.rows + '&shell=' + shellType,
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			'Accept': 'application/json',
+			'Authorization': `Bearer ${accessTokens.resource}`,
+			'Referer': consoleUrl.protocol + "//" + consoleUrl.hostname + '/$hc' + consoleUrl.pathname + '/terminals',
+		},
+		simple: false,
+		resolveWithFullResponse: true,
+		json: true,
+		body: {
+			tokens: accessTokens.keyVault ? [accessTokens.keyVault] : []
+		}
 	});
 }
